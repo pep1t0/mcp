@@ -1,6 +1,5 @@
 """
-Servidor MCP para consultar el clima usando la API de NWS (National Weather Service)
-CORREGIDO con todos los errores solucionados
+MCP Server for weather information using NWS (National Weather Service) API
 """
 from typing import Any
 import httpx
@@ -52,15 +51,24 @@ Instructions: {props.get('instruction', 'No specific instructions provided')}
 @mcp.tool()
 async def get_alerts(state: str) -> str:
     """
-    Get weather alerts for a US state.
+    Get active weather alerts for a US state.
+    
+    Queries the National Weather Service API for current weather alerts,
+    warnings, and watches for a specified US state.
     
     Args:
-        state: Two-letter US state code (e.g. CA, NY)
+        state: Two-letter US state code (e.g., 'CA' for California, 'NY' for New York)
     
     Returns:
-        String with formatted alerts or error message
+        Formatted string with active alerts including event type, affected areas,
+        severity level, description, and instructions. Returns success message if
+        no alerts are active.
+    
+    Example:
+        get_alerts("CA")  # Get alerts for California
+        get_alerts("TX")  # Get alerts for Texas
     """
-    # Validar código de estado
+    # Validate state code
     if len(state) != 2 or not state.isalpha():
         return "❌ Invalid state code. Use two-letter codes like CA, NY, TX"
     
@@ -84,16 +92,32 @@ async def get_alerts(state: str) -> str:
 @mcp.tool()
 async def get_forecast(latitude: float, longitude: float) -> str:
     """
-    Get weather forecast for a location.
+    Get weather forecast for a specific location using coordinates.
+    
+    Retrieves detailed weather forecast from the National Weather Service
+    for any location within the United States. Returns forecast for the
+    next 5 periods (typically covering 2-3 days).
     
     Args:
-        latitude: Latitude of the location (-90 to 90)
-        longitude: Longitude of the location (-180 to 180)
+        latitude: Latitude coordinate (-90 to 90). Positive = North, Negative = South
+        longitude: Longitude coordinate (-180 to 180). Positive = East, Negative = West
     
     Returns:
-        String with formatted forecast or error message
+        Formatted string with forecast periods including:
+        - Period name (e.g., "Tonight", "Monday")
+        - Temperature and unit (°F)
+        - Wind speed and direction
+        - Detailed forecast description
+    
+    Example:
+        get_forecast(37.7749, -122.4194)  # San Francisco, CA
+        get_forecast(40.7128, -74.0060)   # New York City, NY
+    
+    Note:
+        Only works for locations within the United States. International
+        locations will return an error message.
     """
-    # Validar coordenadas
+    # Validate coordinates
     if not (-90 <= latitude <= 90):
         return "❌ Invalid latitude. Must be between -90 and 90."
     if not (-180 <= longitude <= 180):

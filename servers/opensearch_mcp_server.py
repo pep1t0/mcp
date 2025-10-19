@@ -10,9 +10,6 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
-# Initialize the embedding model (intfloat/multilingual-e5-base)
-# This model matches the one used to generate embeddings in your OpenSearch index
-# Note: No print statements allowed when using stdio transport (breaks JSONRPC protocol)
 import sys
 import logging
 
@@ -80,10 +77,7 @@ client = get_opensearch_client()
 mcp = FastMCP("opensearch-mcp-server")
 
 
-@mcp.tool(
-    name="vector_search",
-    description="Perform semantic similarity search to find documents with similar meaning. Best for: finding related incidents, similar threats, or content with similar context. Text queries are automatically converted to embeddings using intfloat/multilingual-e5-base."
-)
+@mcp.tool()
 async def vector_search(
         query: str = Field(..., description="Text query describing what you're looking for (will be converted to semantic embedding automatically)."),
         index_name: Optional[str] = Field(default=None, description="The name of the target index in OpenSearch (e.g., 'telegram_osint', 'incibe_osint'). Leave as null to use the default index from configuration."),
@@ -92,14 +86,29 @@ async def vector_search(
         filter_query: Optional[Union[Dict[str, Any], str]] = Field(default=None, description="Optional OpenSearch query DSL filter (leave as null if not needed).")
 ):
     """
-    Perform similarity search using KNN query with intfloat/multilingual-e5-base embeddings.
+    Perform semantic similarity search using vector embeddings.
     
-    :param query: str - Text query
-    :param index_name: Optional[str] - Target index name (defaults to config value)
-    :param vector_field: Optional[str] - Name of vector field (defaults to config)
-    :param top_k: int - Number of results to return
-    :param filter_query: Optional[Union[Dict, str]] - OpenSearch DSL filter (can be dict or JSON string)
-    :return: JSON string with search results
+    This tool converts text queries into semantic embeddings using the 
+    intfloat/multilingual-e5-base model (768 dimensions) and searches
+    for the most similar documents in the OpenSearch index using KNN.
+    
+    Best for finding documents with similar meaning, related incidents,
+    similar threats, or content with similar context.
+    
+    Args:
+        query: Text query describing what you're looking for (will be converted to embedding)
+        index_name: Target index name (e.g., 'telegram_osint'). If null, uses default from config
+        vector_field: Name of vector field (default: 'content_embedding'). If null, uses default
+        top_k: Number of top similar results to return (max: 10000)
+        filter_query: Optional OpenSearch Query DSL filter as dict or JSON string
+    
+    Returns:
+        JSON string with search results including score, id, and source for each hit
+    
+    Example:
+        vector_search("ransomware attacks on hospitals", top_k=5)
+        vector_search("phishing campaigns", index_name="telegram_osint", 
+                     filter_query='{"range": {"date": {"gte": "2024-01-01"}}}')
     """
     try:
         # Use configured defaults if not specified
@@ -131,6 +140,12 @@ async def vector_search(
         else:
             raise ValueError("query must be a string or a list of floats")
         
+        source_filter = {
+            "_source": {
+                "includes": ["url", "published_at", "content_text", "criticality_score", "analysis_justification"]
+            }
+        }
+
         # Build KNN query
         knn_query = {
             "size": top_k,
@@ -141,7 +156,8 @@ async def vector_search(
                         "k": top_k
                     }
                 }
-            }
+            },
+            **source_filter
         }
         
         # Add filter if provided and valid
@@ -182,20 +198,28 @@ async def vector_search(
         raise Exception(error_msg) from e
 
 
-@mcp.tool(
-    name="get_documents_by_ids",
-    description="Retrieve documents by their IDs from OpenSearch index."
-)
+@mcp.tool()
 async def get_documents_by_ids(
         ids: List[str] = Field(..., description="List of document IDs to retrieve."),
         index_name: Optional[str] = Field(default=None, description="The name of the target index in OpenSearch. Leave as null to use the default index from configuration.")
 ):
     """
-    Retrieve multiple documents by their IDs.
+    Retrieve specific documents by their IDs from OpenSearch.
     
-    :param ids: List[str] - Document IDs
-    :param index_name: Optional[str] - Target index name (defaults to config value)
-    :return: JSON with documents
+    This is the fastest way to fetch documents when you already know
+    their IDs (e.g., from a previous search or cached references).
+    Uses OpenSearch mget API for efficient multi-document retrieval.
+    
+    Args:
+        ids: List of document IDs to retrieve (e.g., ['doc1', 'doc2', 'doc3'])
+        index_name: Target OpenSearch index name. If null, uses default from configuration
+    
+    Returns:
+        JSON string with total_requested, total_found, and documents array
+    
+    Example:
+        get_documents_by_ids(["abc123", "def456", "ghi789"])
+        get_documents_by_ids(["incident_2024_001"], index_name="security_logs")
     """
     try:
         # Use configured default index if not specified
@@ -203,10 +227,18 @@ async def get_documents_by_ids(
             index_name = config["default_index"]
         
         logger.info(f"📄 Fetching {len(ids)} documents from '{index_name}'...")
+
+        # ✅ Definir body y filtros de forma clara y separada
+        mget_body = {"ids": ids}
+        source_includes = ["url", "published_at", "content_text", "criticality_score", "analysis_justification"]
         
         # Use mget (multi-get) to fetch multiple documents
-        response = client.mget(index=index_name, body={"ids": ids})
-        
+        response = client.mget(
+            index=index_name, 
+            body=mget_body,
+            _source_includes=source_includes
+        )
+
         documents = []
         for doc in response["docs"]:
             if doc["found"]:
@@ -230,10 +262,7 @@ async def get_documents_by_ids(
         raise Exception(error_msg) from e
 
 
-@mcp.tool(
-    name="text_search",
-    description="Perform a full-text search in OpenSearch index. Use this to search for text content across all fields or specific fields."
-)
+@mcp.tool()
 async def text_search(
         query_text: str = Field(..., description="The text to search for."),
         index_name: Optional[str] = Field(default=None, description="The name of the target index in OpenSearch. Leave as null to use the default index from configuration."),
@@ -241,13 +270,27 @@ async def text_search(
         top_k: int = Field(default=10, description="Number of results to return.")
 ):
     """
-    Perform full-text search using OpenSearch match query.
+    Perform full-text search across document fields using OpenSearch match queries.
     
-    :param query_text: str - Search query
-    :param index_name: Optional[str] - Target index (defaults to config value)
-    :param fields: Optional[List[str]] - Fields to search
-    :param top_k: int - Number of results
-    :return: JSON with search results
+    Unlike vector_search which finds semantic similarity, text_search looks
+    for exact or partial keyword matches. It uses BM25 ranking algorithm
+    and supports fuzzy matching.
+    
+    Best for searching specific keywords or phrases, finding documents containing
+    exact terms, or searching within specific fields (title, author, etc.).
+    
+    Args:
+        query_text: Text to search for. Supports natural language queries, keywords, and phrases
+        index_name: Target OpenSearch index. If null, uses default from configuration
+        fields: Specific fields to search in (e.g., ['title', 'content_text']). If null, searches all text fields
+        top_k: Number of results to return
+    
+    Returns:
+        JSON string with search results including score, id, and source for each hit
+    
+    Example:
+        text_search("CVE-2024-1234", fields=["vulnerability_id", "description"])
+        text_search("incident report", top_k=20)
     """
     try:
         # Use configured default index if not specified
@@ -255,7 +298,14 @@ async def text_search(
             index_name = config["default_index"]
         
         logger.info(f"📝 Performing text search in '{index_name}' for: '{query_text[:50]}...'")
-        
+
+        # Incluir SOLO campos esenciales para LLM
+        source_filter = {
+            "_source": {
+                "includes": ["url", "published_at", "content_text", "criticality_score", "analysis_justification"]
+            }
+        }
+
         # Build query
         if fields:
             # Multi-field search
@@ -266,19 +316,21 @@ async def text_search(
                         "query": query_text,
                         "fields": fields
                     }
-                }
+                },
+                **source_filter
             }
         else:
             # Search all fields
-            search_query = {
+           search_query = {
                 "size": top_k,
                 "query": {
-                    "match": {
-                        "_all": query_text
+                    "multi_match": {
+                        "query": query_text
                     }
-                }
+                },
+                **source_filter
             }
-        
+
         response = client.search(index=index_name, body=search_query)
         
         # Format results
@@ -305,10 +357,7 @@ async def text_search(
         raise Exception(error_msg) from e
 
 
-@mcp.tool(
-    name="hybrid_search",
-    description="Perform a hybrid search combining vector similarity and full-text search. Best for comprehensive searches."
-)
+@mcp.tool()
 async def hybrid_search(
         query_text: str = Field(..., description="Text query for both embedding generation and text search."),
         index_name: Optional[str] = Field(default=None, description="The name of the target index in OpenSearch. Leave as null to use the default index from configuration."),
@@ -318,15 +367,34 @@ async def hybrid_search(
         vector_weight: float = Field(default=0.7, description="Weight for vector search between 0 and 1 (default: 0.7). Text search gets (1-weight).")
 ):
     """
-    Perform hybrid search combining KNN vector search and full-text search.
+    Perform hybrid search combining vector similarity and full-text matching.
     
-    :param query_text: str - Query text
-    :param index_name: Optional[str] - Target index (defaults to config value)
-    :param vector_field: Optional[str] - Vector field name
-    :param text_fields: Optional[List[str]] - Text fields to search
-    :param top_k: int - Number of results
-    :param vector_weight: float - Weight for vector vs text (0-1)
-    :return: JSON with combined results
+    This tool provides the best of both worlds by combining:
+    1. Semantic understanding (vector search) - finds conceptually similar documents
+    2. Keyword precision (text search) - finds exact term matches
+    
+    Results are scored using a weighted combination of both methods, allowing
+    you to balance between semantic relevance and keyword accuracy.
+    
+    Best for comprehensive security threat searches, finding documents that match
+    both concept AND keywords, or general-purpose search with best coverage.
+    
+    Args:
+        query_text: Text query used for both embedding generation and keyword matching
+        index_name: Target OpenSearch index. If null, uses default from configuration
+        vector_field: Vector field name. If null, uses default from configuration
+        text_fields: Fields to search text in (e.g., ['title', 'content']). If null, searches all fields
+        top_k: Number of results to return
+        vector_weight: Weight for vector search (0-1). Text search gets (1-weight). 
+                      Higher values favor semantic similarity. Default: 0.7 (70% semantic, 30% keyword)
+    
+    Returns:
+        JSON string with search results including score, id, and source for each hit
+    
+    Example:
+        hybrid_search("malware analysis tools", vector_weight=0.5)  # Equal weight
+        hybrid_search("DDoS mitigation", vector_weight=0.8, top_k=15)  # Favor semantics
+        hybrid_search("CVE database", text_fields=["title", "summary"])
     """
     try:
         # Use configured defaults if not specified
@@ -339,7 +407,12 @@ async def hybrid_search(
         
         # Generate embedding
         vector = embedding_model.encode(query_text).tolist()
-        
+
+        source_filter = {
+            "_source": {
+                "includes": ["url", "published_at", "content_text", "criticality_score", "analysis_justification"]
+            }
+        }       
         # Build hybrid query
         if text_fields:
             text_query = {
@@ -350,8 +423,8 @@ async def hybrid_search(
             }
         else:
             text_query = {
-                "match": {
-                    "_all": query_text
+                "multi_match": {
+                    "query": query_text
                 }
             }
         
@@ -361,22 +434,32 @@ async def hybrid_search(
             "query": {
                 "bool": {
                     "should": [
+                        # KNN con constant_score para aplicar boost correctamente
                         {
-                            "knn": {
-                                vector_field: {
-                                    "vector": vector,
-                                    "k": top_k,
-                                    "boost": vector_weight
-                                }
+                            "constant_score": {
+                                "filter": {
+                                    "knn": {
+                                        vector_field: {
+                                            "vector": vector,
+                                            "k": top_k
+                                        }
+                                    }
+                                },
+                                "boost": vector_weight
                             }
                         },
+                        # Multi-match con boost interno
                         {
-                            **text_query,
-                            "boost": 1.0 - vector_weight
+                            "multi_match": {
+                                "query": query_text,
+                                **({"fields": text_fields} if text_fields else {}),
+                                "boost": 1.0 - vector_weight
+                            }
                         }
                     ]
                 }
-            }
+            },
+            **source_filter
         }
         
         response = client.search(index=index_name, body=hybrid_query)
@@ -406,4 +489,8 @@ async def hybrid_search(
 
 
 if __name__ == "__main__":
-    mcp.run()
+
+    logger.info("🚀 Starting OpenSearch MCP Server with streamable_http transport")
+    mcp.run(
+        transport="streamable-http"
+    )  # streamable_http por defecto

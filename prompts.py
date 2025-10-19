@@ -30,6 +30,10 @@ class GoalEvaluation(BaseModel):
     )
     next_step: str = Field(default="", description="Siguiente paso a realizar (si status='in_progress')")
     reasoning: str = Field(description="Razonamiento de la evaluación")
+    no_tools_available: bool = Field(
+        default=False,
+        description="Marca como True si NO existen herramientas disponibles para completar el objetivo. Esto finalizará la ejecución inmediatamente."
+    )
 
 
 # ==========================
@@ -124,12 +128,19 @@ ESTADOS POSIBLES:
 - 'in_progress': Aún necesitas ejecutar herramientas para obtener información (especifica next_step)
 - 'failed': No puedes continuar (sin herramientas útiles, bloqueado, imposible)
 
+CAMPO ESPECIAL - no_tools_available:
+- Marca como **True** si NINGUNA de las herramientas disponibles puede ayudar con el objetivo
+- Esto finalizará la ejecución INMEDIATAMENTE, evitando iteraciones innecesarias
+- Usa esto cuando el objetivo requiere capacidades que NO existen en las herramientas
+- Ejemplos: preguntas sobre tu identidad, modelo de IA, capacidades internas, filosofía, etc.
+
 REGLAS CRÍTICAS:
 1. Si el historial está VACÍO o el último resultado es "Comenzando..." → SIEMPRE marca 'in_progress'
 2. Solo marca 'completed' si YA ejecutaste herramientas y tienes resultados reales
 3. Si necesitas información del sistema → marca 'in_progress' y especifica qué herramienta usar
 4. **IMPORTANTE**: Si necesitas descargar múltiples archivos, especifica UNO SOLO por iteración en next_step
 5. El next_step debe ser muy específico: incluye el nombre exacto de la herramienta Y sus parámetros
+6. Si no_tools_available=True → Explica en 'reasoning' POR QUÉ ninguna herramienta puede ayudar
 
 Ejemplo:
 - Objetivo: "dime qué usuario estoy usando"
@@ -141,7 +152,13 @@ Ejemplo con parámetros:
 - Objetivo: "descargar archivos del FTP"
 - Historial: [lista con flag.txt y reddit.png]
 - Último resultado: "Archivos encontrados: flag.txt, reddit.png"
-→ Estado: 'in_progress', next_step: 'Usar ftp_download_file(ip=192.168.0.248, filename=flag.txt) para descargar el primer archivo'"""),
+→ Estado: 'in_progress', next_step: 'Usar ftp_download_file(ip=192.168.0.248, filename=flag.txt) para descargar el primer archivo', no_tools_available: False
+
+Ejemplo sin herramientas disponibles:
+- Objetivo: "¿Qué modelo de IA eres?"
+- Historial: []
+- Último resultado: "Comenzando..."
+→ Estado: 'in_progress', next_step: '', reasoning: 'Ninguna herramienta disponible permite introspección del modelo de IA', no_tools_available: True"""),
         ("human", """Objetivo del usuario: {goal}
 
 Historial de acciones:

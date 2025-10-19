@@ -1,9 +1,11 @@
 """
 Agente MCP implementado con LangGraph para flujos más robustos.
+Versión optimizada para OpenAI con Structured Outputs.
 """
 import asyncio
 from typing import TypedDict, Annotated, Literal
 from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from prompts import (
@@ -32,6 +34,7 @@ class AgentState(TypedDict):
     max_iterations: int
     final_answer: str
     tool_decision: dict  # Decisión de qué herramienta usar
+    failed_attempts: dict  # Contador de intentos fallidos por herramienta
 
 
 # ==========================
@@ -94,40 +97,44 @@ Parámetros:
         self.available_tools = [tool.name for tool in tools_info]
         print(f"🛠️ Herramientas disponibles: {self.available_tools}\n")
         
-        # Crear los prompts dinámicamente con las herramientas descubiertas
+        # ✅ CAMBIO: Usar method="function_calling" para mejor compatibilidad con OpenAI
         decision_template = create_decision_template(tools_description)
-        self.decision_chain = decision_template | self.llm.with_structured_output(ToolDecision)
+        self.decision_chain = decision_template | self.llm.with_structured_output(
+            ToolDecision,
+            method="function_calling"  # ← Evita errores de schema con OpenAI
+        )
         
         evaluation_template = create_evaluation_template(tools_description)
-        self.evaluation_chain = evaluation_template | self.llm.with_structured_output(GoalEvaluation)
+        self.evaluation_chain = evaluation_template | self.llm.with_structured_output(
+            GoalEvaluation,
+            method="function_calling"  # ← Evita errores de schema con OpenAI
+        )
     
     async def evaluate_node(self, state: AgentState) -> AgentState:
         """Evalúa el progreso y decide el siguiente paso."""
         print(f"\n--- Iteración {state['iteration']}/{state['max_iterations']} ---")
         print("📊 Evaluando progreso...")
         
-        evaluation: GoalEvaluation = await self.evaluation_chain.ainvoke({
-            "goal": state["goal"],
-            "history": str(state["history"][-5:]),
-            "last_result": state["last_result"]
-        })
-        
-        print(f"🧠 Evaluación: {evaluation.reasoning}")
-        print(f"📌 Estado: {evaluation.status}")
-        
-        # Mapear el status único a los campos del estado
-        state["completed"] = evaluation.status == "completed"
-        state["can_continue"] = evaluation.status == "in_progress"
-        state["current_step"] = evaluation.next_step
-        state["iteration"] += 1
-        
-        # ✅ DETECCIÓN ESTRUCTURADA: Si no_tools_available=True, finalizar inmediatamente
-        if evaluation.no_tools_available:
-            print("🛑 El LLM determinó que no hay herramientas disponibles para esta tarea")
-            print(f"   Razón: {evaluation.reasoning}")
-            state["completed"] = True  # Marcar como completado
-            state["can_continue"] = False  # Detener iteraciones
-            state["last_result"] = evaluation.reasoning  # Guardar explicación del LLM
+        try:
+            evaluation: GoalEvaluation = await self.evaluation_chain.ainvoke({
+                "goal": state["goal"],
+                "history": str(state["history"][-5:]),
+                "last_result": state["last_result"]
+            })
+            
+            print(f"🧠 Evaluación: {evaluation.reasoning}")
+            print(f"📌 Estado: {evaluation.status}")
+            
+            # Mapear el status único a los campos del estado
+            state["completed"] = evaluation.status == "completed"
+            state["can_continue"] = evaluation.status == "in_progress"
+            state["current_step"] = evaluation.next_step
+            state["iteration"] += 1
+            
+        except Exception as e:
+            print(f"❌ Error en evaluate_node: {str(e)}")
+            state["can_continue"] = False
+            state["completed"] = False
         
         return state
     
@@ -143,6 +150,15 @@ Parámetros:
             print(f"🧠 Razonamiento: {decision.reasoning}")
             print(f"🔧 Tool sugerida: {decision.tool}")
             print(f"❓ Needs tool: {decision.needs_tool}")
+            
+            # ✅ NUEVO: Detectar loops infinitos
+            if decision.tool and decision.needs_tool:
+                failed_count = state.get("failed_attempts", {}).get(decision.tool, 0)
+                if failed_count >= 3:
+                    print(f"⚠️  LOOP DETECTADO: {decision.tool} ha fallado {failed_count} veces. Cancelando.")
+                    state["can_continue"] = False
+                    state["last_result"] = f"Loop detectado: {decision.tool} falló múltiples veces. Ya tengo suficiente información de la búsqueda inicial."
+                    return state
             
             # Corrección: Si needs_tool=True pero tool está vacío, extraer del next_step
             if decision.needs_tool and not decision.tool:
@@ -206,24 +222,31 @@ Parámetros:
         
         print(f"⚙️  Ejecutando: {tool_name}({args})")
         
+        # Inicializar failed_attempts si no existe
+        if "failed_attempts" not in state:
+            state["failed_attempts"] = {}
+        
         try:
-            # Buscar la herramienta por nombre en las tools disponibles
+            # Usar el cache de herramientas en lugar de llamar get_tools() cada vez
             tool_obj = self.tools_cache.get(tool_name)
-            if not tool_obj:
-                tools = await self.client.get_tools()
-                tool_obj = next((t for t in tools if t.name == tool_name), None)
 
             if not tool_obj:
                 result_str = f"Error: Herramienta '{tool_name}' no encontrada"
                 print(f"❌ {result_str}")
+                # ✅ Incrementar contador de fallos
+                state["failed_attempts"][tool_name] = state["failed_attempts"].get(tool_name, 0) + 1
             else:
                 # Invocar la herramienta usando LangChain
                 result = await tool_obj.ainvoke(args)
                 result_str = str(result)[:3000]  
                 print(f"✅ Resultado: {result_str}")
+                # ✅ Reset contador si tuvo éxito
+                state["failed_attempts"][tool_name] = 0
         except Exception as e:
             result_str = f"Error: {str(e)}"
             print(f"❌ {result_str}")
+            # ✅ Incrementar contador de fallos
+            state["failed_attempts"][tool_name] = state["failed_attempts"].get(tool_name, 0) + 1
         
         state["history"].append({
             "step": state["current_step"],
@@ -241,32 +264,12 @@ Parámetros:
         print("🎉 ¡OBJETIVO COMPLETADO!")
         print(f"{'='*60}\n")
         
-        # ✅ Si no hay historial (no se ejecutaron herramientas), usar last_result directamente
-        if not state["history"]:
-            # El LLM ya explicó por qué no puede responder en last_result
-            # state["final_answer"] = state["last_result"]
-            
-            # En lugar de usar last_result (razonamiento técnico), generar respuesta natural
-            social_response_prompt = f"""
-            El usuario dijo: "{state['goal']}"
-            
-            Esta es una interacción que no requiere herramientas.
-            Genera una respuesta natural, amigable y cortés en español teniendo presente lo que
-            el usuario escribó {state['goal']} así como la reflexión interna del asistente: {state['last_result']}.
-
-            Respuesta:
-            """
-            
-            # Usar el LLM para generar respuesta natural
-            response = await self.llm.ainvoke(social_response_prompt)
-            state["final_answer"] = response.content.strip()
-        else:
-            # Si hay historial, generar resumen de las acciones realizadas
-            response: Response = await self.response_chain.ainvoke({
-                "question": f"Resume lo que hiciste para cumplir: {state['goal']}",
-                "tool_result": str(state["history"])
-            })
-            state["final_answer"] = response.answer
+        response: Response = await self.response_chain.ainvoke({
+            "question": f"Resume lo que hiciste para cumplir: {state['goal']}",
+            "tool_result": str(state["history"])
+        })
+        
+        state["final_answer"] = response.answer
         
         return state
 
@@ -341,22 +344,23 @@ async def create_agent_graph(llm, client):
 # ==========================
 
 async def main():
-    llm = ChatOllama(
-        model="qwen3:8b", 
-        base_url="http://localhost:11434", 
-        temperature=0,
+    # ✅ Configuración para OpenAI con gpt-4o-mini
+    llm = ChatOpenAI(
+        model="gpt-4o-mini", 
+        temperature=0.1,
         timeout=120  # 2 minutos de timeout
     )
     
     client = MultiServerMCPClient({
         "shell": {
             "command": "python",
-            "args": ["/Users/dani/Proyectos/mcp/servers/shell_mcp_server_local.py"],
+            "args": ["/Users/dani/Proyectos/mcp/shell_mcp_server_local.py"],
             "transport": "stdio",
         },
         "opensearch": {
-            "transport": "streamable_http",
-            "url": "http://localhost:8000/mcp",  # URL del servidor weather_mcp_server_remote.py
+            "command": "python",
+            "args": ["/Users/dani/Proyectos/mcp/opensearch_mcp_server.py"],
+            "transport": "stdio"
         }
     })
     
@@ -364,7 +368,7 @@ async def main():
     graph = await create_agent_graph(llm, client)
     
     print("="*60)
-    print("🤖 AGENTE MCP con LangGraph")
+    print("🤖 AGENTE MCP con LangGraph (OpenAI)")
     print("="*60)
     print("📝 Escribe un objetivo (o 'salir' para terminar)")
     print("="*60)
@@ -391,7 +395,8 @@ async def main():
             "iteration": 0,
             "max_iterations": 15,
             "final_answer": "",
-            "tool_decision": {}
+            "tool_decision": {},
+            "failed_attempts": {}  # ✅ Inicializar contador de fallos
         }
         
         # Ejecutar el grafo
