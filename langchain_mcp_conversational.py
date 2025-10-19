@@ -2,7 +2,7 @@
 Agente MCP implementado con LangGraph para flujos más robustos.
 """
 import asyncio
-from typing import TypedDict, Annotated, Literal
+from typing import TypedDict, Annotated, Literal, Any
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -17,13 +17,24 @@ from prompts import (
 
 
 # ==========================
-# 📦 ESTADO DEL AGENTE
+# 📦 MODELOS DE DATOS
 # ==========================
+
+class HistoryEntry(TypedDict):
+    """Entrada individual en el historial de acciones ejecutadas por el agente."""
+    step: str
+    tool: str
+    args: dict[str, Any]
+    result: str
+
 
 class AgentState(TypedDict):
     """Estado que se pasa entre nodos del grafo."""
     goal: str
-    history: list[dict]
+    history: Annotated[
+        list[HistoryEntry], 
+        "Historial de acciones ejecutadas. Cada entrada contiene: step, tool, args, result"
+    ]
     current_step: str
     last_result: str
     completed: bool
@@ -31,7 +42,7 @@ class AgentState(TypedDict):
     iteration: int
     max_iterations: int
     final_answer: str
-    tool_decision: dict  # Decisión de qué herramienta usar
+    tool_decision: dict[str, Any]  # Decisión de qué herramienta usar
 
 
 # ==========================
