@@ -77,6 +77,59 @@ client = get_opensearch_client()
 mcp = FastMCP("opensearch-mcp-server")
 
 
+@mcp.tool(
+    name="get_indexes",
+    description="List all available indexes in OpenSearch. Use this to discover what indexes exist before performing searches with other tools."
+)
+async def get_indexes():
+    """
+    Retrieve all available indexes from OpenSearch instance.
+    
+    This tool queries the OpenSearch cluster to get a list of all existing
+    indexes. Use this to discover what data sources are available before
+    performing vector_search, text_search, or hybrid_search operations.
+    
+    Returns:
+        JSON string with total count and list of index names
+        
+    Example response:
+        {
+            "total_indexes": 3,
+            "indexes": ["incibe_osint", "telegram_osint", "documents"]
+        }
+    
+    Example:
+        get_indexes()  # Returns all available indexes
+    """
+    try:
+        logger.info("📋 Retrieving list of indexes from OpenSearch...")
+        
+        # Get all indexes using cat API
+        response = client.cat.indices(format='json')
+        
+        # Extract index names, filtering only user OSINT indexes (ending with _osint)
+        index_names = [
+            index_info.get("index", "") 
+            for index_info in response 
+            if index_info.get("index", "").endswith("_osint")
+        ]
+        
+        result = {
+            "total_indexes": len(index_names),
+            "indexes": sorted(index_names)  # Sort alphabetically for consistency
+        }
+        
+        logger.info(f"✅ Found {len(index_names)} OSINT indexes: {', '.join(index_names[:5])}{'...' if len(index_names) > 5 else ''}")
+        return json.dumps(result, ensure_ascii=False, default=str)
+        
+    except Exception as e:
+        error_msg = f"Error in get_indexes: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        raise Exception(error_msg) from e
+        logger.info(f"❌ {error_msg}")
+        raise Exception(error_msg) from e
+
+
 @mcp.tool()
 async def vector_search(
         query: str = Field(..., description="Text query describing what you're looking for (will be converted to semantic embedding automatically)."),
