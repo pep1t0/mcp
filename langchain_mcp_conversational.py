@@ -354,7 +354,7 @@ async def create_agent_graph(llm, client):
 async def main():
     llm = ChatOllama(
         model="qwen3:8b", 
-        base_url="http://192.168.1.52:11434", 
+        base_url="http://localhost:11434", 
         temperature=0,
         timeout=120  # 2 minutos de timeout
     )
@@ -362,13 +362,13 @@ async def main():
     client = MultiServerMCPClient({
         "shell": {
             "command": "python",
-            "args": ["/Users/dani/Projectes/mcp/servers/shell_mcp_server_local.py"],
+            "args": ["/Users/dani/Proyectos/mcp/servers/shell_mcp_server_local.py"],
             "transport": "stdio",
         },
-        "nmap": {
-            "transport": "streamable_http",
-            "url": "http://172.16.207.128:8080/mcp",  # URL del servidor nmap
-        },        
+        # "nmap": {
+        #     "transport": "streamable_http",
+        #     "url": "http://172.16.207.128:8080/mcp",  # URL del servidor nmap
+        # },        
         "opensearch": {
             "transport": "streamable_http",
             "url": "http://localhost:8000/mcp",  # URL del servidor weather_mcp_server_remote.py
