@@ -365,6 +365,10 @@ async def main():
             "args": ["/Users/dani/Projectes/mcp/servers/shell_mcp_server_local.py"],
             "transport": "stdio",
         },
+        "nmap": {
+            "transport": "streamable_http",
+            "url": "http://172.16.207.128:8080/mcp",  # URL del servidor nmap
+        },        
         "opensearch": {
             "transport": "streamable_http",
             "url": "http://localhost:8000/mcp",  # URL del servidor weather_mcp_server_remote.py
