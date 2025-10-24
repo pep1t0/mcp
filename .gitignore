@@ -1,3 +1,4 @@
 # /.env
+/__pycache__/
 /vsftpd.conf
 .DS_Store
