@@ -362,7 +362,7 @@ async def main():
     client = MultiServerMCPClient({
         "shell": {
             "command": "python",
-            "args": ["/Users/dani/Proyectos/mcp/servers/shell_mcp_server_local.py"],
+            "args": ["/Users/dani/Projectes/mcp/servers/shell_mcp_server_local.py"],
             "transport": "stdio",
         },
         # "nmap": {
@@ -372,6 +372,11 @@ async def main():
         "opensearch": {
             "transport": "streamable_http",
             "url": "http://localhost:8000/mcp",  # URL del servidor weather_mcp_server_remote.py
+        },
+        "internet": {
+            "command": "python",
+            "args": ["/Users/dani/Projectes/mcp/servers/internet_mcp_server.py"],
+            "transport": "stdio",
         }
     })
     

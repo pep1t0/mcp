@@ -126,8 +126,6 @@ async def get_indexes():
         error_msg = f"Error in get_indexes: {str(e)}"
         logger.error(f"❌ {error_msg}")
         raise Exception(error_msg) from e
-        logger.info(f"❌ {error_msg}")
-        raise Exception(error_msg) from e
 
 
 @mcp.tool()
@@ -537,6 +535,81 @@ async def hybrid_search(
         
     except Exception as e:
         error_msg = f"Error in hybrid_search: {str(e)}"
+        logger.info(f"❌ {error_msg}")
+        raise Exception(error_msg) from e
+
+
+@mcp.tool()
+async def get_index_mapping(
+    index_name: Optional[str] = Field(default=None, description="The name of the index to retrieve field mappings for. Leave as null to use the default index from configuration.")
+):
+    """
+    Retrieve the field mappings/schema for a specific OpenSearch index.
+    
+    This tool provides detailed information about the structure of an index, including
+    all field types (text, keyword, date, long, double, knn_vector, etc.), field
+    properties, analyzers, nested object structures, and vector field configurations.
+    
+    Use this tool to:
+    - Discover what fields exist in an index before running searches
+    - Check vector field dimensions and similarity metrics
+    - Understand field types to construct proper queries
+    - Identify searchable text fields for text_search or hybrid_search
+    
+    Args:
+        index_name: Target OpenSearch index name. If null, uses default from configuration
+    
+    Returns:
+        JSON string with index name and complete field mapping structure
+    
+    Example response:
+        {
+            "index_name": "telegram_osint",
+            "total_fields": 15,
+            "fields": {
+                "content_text": {"type": "text"},
+                "content_embedding": {"type": "knn_vector", "dimension": 768},
+                "published_at": {"type": "date"},
+                "url": {"type": "keyword"}
+            }
+        }
+    
+    Example:
+        get_index_mapping()  # Uses default index
+        get_index_mapping("incibe_osint")  # Specific index
+    """
+    try:
+        # Use configured default index if not specified
+        if index_name is None:
+            index_name = config["default_index"]
+        
+        logger.info(f"🗂️  Retrieving field mappings for index: '{index_name}'...")
+        
+        # Get index mapping using OpenSearch _mapping API
+        response = client.indices.get_mapping(index=index_name)
+        
+        # Extract the mapping for the specific index
+        if index_name in response:
+            mapping = response[index_name]["mappings"]
+            
+            # Extract field list for easier consumption by LLM
+            fields = mapping.get("properties", {})
+            
+            result = {
+                "index_name": index_name,
+                "total_fields": len(fields),
+                "fields": fields
+            }
+            
+            logger.info(f"✅ Retrieved {len(fields)} fields from '{index_name}'")
+            return json.dumps(result, ensure_ascii=False, default=str)
+        else:
+            error_msg = f"Index '{index_name}' not found in mapping response"
+            logger.info(f"❌ {error_msg}")
+            raise Exception(error_msg)
+            
+    except Exception as e:
+        error_msg = f"Error in get_index_mapping: {str(e)}"
         logger.info(f"❌ {error_msg}")
         raise Exception(error_msg) from e
 
