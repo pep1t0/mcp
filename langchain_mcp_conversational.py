@@ -2,6 +2,7 @@
 Agente MCP implementado con LangGraph para flujos más robustos.
 """
 import asyncio
+import json
 from enum import Enum
 from typing import TypedDict, Annotated, Literal, Any, Optional
 from langgraph.graph import StateGraph, END
@@ -377,8 +378,31 @@ Parámetros:
             else:
                 # Invocar la herramienta usando LangChain
                 result = await tool_obj.ainvoke(args)
-                result_str = str(result)[:3000]  
-                print(f"✅ Resultado: {result_str}")
+                
+                # ✅ NUEVO: Extracción inteligente para verify_and_extract
+                try:
+                    result_json = json.loads(str(result))
+                    
+                    if tool_name == "verify_and_extract":
+                        # Crear resumen estructurado priorizando links
+                        summary = {
+                            "url": result_json.get("url"),
+                            "title": result_json.get("title", "Sin título"),
+                            "status": result_json.get("status_code"),
+                            "accessible": result_json.get("is_accessible", False),
+                            "text_preview": result_json.get("text", "")[:1000],  # Primer 1KB del texto
+                            "links": result_json.get("links", [])[:15]  # ✅ Primeros 15 enlaces con contexto
+                        }
+                        result_str = json.dumps(summary, ensure_ascii=False, indent=2)
+                        print(f"✅ Resultado (con links extraídos): {len(result_json.get('links', []))} enlaces encontrados")
+                    else:
+                        # Otras herramientas: truncar normalmente
+                        result_str = str(result)[:3000]
+                except (json.JSONDecodeError, TypeError):
+                    # Si no es JSON o falla el parsing, truncar normalmente
+                    result_str = str(result)[:3000]
+                
+                print(f"✅ Resultado: {result_str[:500]}...")  # Mostrar preview en consola
         except Exception as e:
             result_str = f"Error: {str(e)}"
             print(f"❌ {result_str}")
@@ -552,6 +576,9 @@ async def main():
     print("🔧 Inicializando agente...")
     graph = await create_agent_graph(llm, client)
     
+    # ✅ NUEVO: Historial persistente a nivel de sesión
+    session_history: list[HistoryEntry] = []
+    
     print("="*60)
     print("🤖 AGENTE MCP con LangGraph")
     print("="*60)
@@ -569,13 +596,13 @@ async def main():
         if not user_input:
             continue
         
-        # Estado inicial (nuevo en cada consulta)
+        # Estado inicial con historial de sesión
         initial_state: AgentState = {
             "goal": user_input,
-            "history": [],
-            "full_history": [],
+            "history": session_history[-MAX_HISTORY_WINDOW:],  # ✅ Últimas N entradas de la sesión
+            "full_history": session_history.copy(),             # ✅ Todo el historial de la sesión
             "current_step": "",
-            "last_result": "Comenzando...",
+            "last_result": "Comenzando..." if not session_history else "Continuando sesión...",
             "completed": False,
             "can_continue": True,
             "iteration": 0,
@@ -588,6 +615,10 @@ async def main():
         # Ejecutar el grafo (reutilizado)
         try:
             final_state = await graph.ainvoke(initial_state)
+            
+            # ✅ NUEVO: Actualizar historial de sesión con nuevas entradas
+            new_entries = final_state.get("full_history", [])[len(session_history):]
+            session_history.extend(new_entries)
             
             if final_state.get("final_answer"):
                 print(f"\n✅ {final_state['final_answer']}\n")
