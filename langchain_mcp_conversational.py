@@ -2,10 +2,13 @@
 Agente MCP implementado con LangGraph para flujos más robustos.
 """
 import asyncio
-from typing import TypedDict, Annotated, Literal, Any
+from enum import Enum
+from typing import TypedDict, Annotated, Literal, Any, Optional
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from langchain_core.exceptions import OutputParserException
 from prompts import (
     ToolDecision, 
     Response, 
@@ -20,6 +23,16 @@ from prompts import (
 # 📦 MODELOS DE DATOS
 # ==========================
 
+class AgentStatus(Enum):
+    """Estados posibles del agente para routing explícito."""
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    MAX_ITERATIONS = "max_iterations"
+    NO_TOOLS = "no_tools"
+
+
 class HistoryEntry(TypedDict):
     """Entrada individual en el historial de acciones ejecutadas por el agente."""
     step: str
@@ -33,7 +46,11 @@ class AgentState(TypedDict):
     goal: str
     history: Annotated[
         list[HistoryEntry], 
-        "Historial de acciones ejecutadas. Cada entrada contiene: step, tool, args, result"
+        "Historial de acciones ejecutadas (últimas 10 para gestión de contexto)"
+    ]
+    full_history: Annotated[
+        list[HistoryEntry],
+        "Historial completo sin límites para logs"
     ]
     current_step: str
     last_result: str
@@ -43,11 +60,15 @@ class AgentState(TypedDict):
     max_iterations: int
     final_answer: str
     tool_decision: dict[str, Any]  # Decisión de qué herramienta usar
+    status: AgentStatus  # Estado explícito del agente
 
 
 # ==========================
 # 🧩 NODOS DEL GRAFO
 # ==========================
+
+# Constantes
+MAX_HISTORY_WINDOW = 10  # Ventana deslizante de historial para contexto LLM
 
 class GraphAgent:
     def __init__(self, llm, client):
@@ -59,6 +80,72 @@ class GraphAgent:
         self.evaluation_chain = None
         self.available_tools = []  # Lista de nombres de herramientas disponibles
         self.tools_cache = {}  # Cache de herramientas por nombre
+    
+    def _format_history_for_llm(self, history: list[HistoryEntry]) -> str:
+        """Formatea el historial para el LLM con ventana deslizante."""
+        if not history:
+            return "Sin acciones previas"
+        
+        # Solo últimas MAX_HISTORY_WINDOW entradas
+        recent_history = history[-MAX_HISTORY_WINDOW:]
+        formatted = []
+        for entry in recent_history:
+            formatted.append(
+                f"Step: {entry['step']}\n"
+                f"Tool: {entry['tool']}\n"
+                f"Args: {entry['args']}\n"
+                f"Result: {entry['result'][:500]}...\n"  # Truncar resultados largos
+            )
+        return "\n".join(formatted)
+    
+    def _validate_tool_decision(self, decision: ToolDecision, state: AgentState) -> ToolDecision:
+        """Valida y corrige la decisión del LLM en código Python."""
+        # Normalizar nombre de herramienta a str (evitar None raros del parser)
+        decision.tool = decision.tool or ""
+
+        # Validación 1: needs_tool=True requiere tool
+        if decision.needs_tool and not decision.tool:
+            # Intentar extraer tool del current_step
+            next_step_lower = state['current_step'].lower()
+            sorted_tools = sorted(self.available_tools, key=len, reverse=True)
+            
+            for tool_name in sorted_tools:
+                if tool_name in next_step_lower:
+                    print(f"⚠️  Corrección automática: Detectado '{tool_name}' en el paso actual")
+                    decision.tool = tool_name
+                    break
+            
+            # Si aún no hay tool, marcar como no necesita
+            if not decision.tool:
+                print(f"⚠️  Corrección: needs_tool=True pero sin tool especificada. Marcando needs_tool=False")
+                decision.needs_tool = False
+        
+        # Validación 2: si se menciona una tool inexistente, no forzar ejecución
+        if decision.tool and decision.tool not in self.available_tools:
+            print(f"❌ Error: Tool '{decision.tool}' no existe. Tools disponibles: {self.available_tools}")
+            decision.needs_tool = False
+            decision.tool = ""
+            decision.arguments = {}
+        
+        # Validación 3: Si queda una tool válida pero needs_tool=False, no forzamos a True;
+        # dejamos que el agente continúe sin ejecutar herramienta en este paso.
+        
+        return decision
+    
+    def _validate_evaluation(self, evaluation: GoalEvaluation) -> GoalEvaluation:
+        """Valida y normaliza la evaluación del LLM."""
+        # Normalizar status
+        valid_statuses = ["completed", "in_progress", "failed"]
+        if evaluation.status not in valid_statuses:
+            print(f"⚠️  Corrección: Status '{evaluation.status}' inválido. Usando 'in_progress'")
+            evaluation.status = "in_progress"
+        
+        # Si no_tools_available=True, debe ser completed o failed
+        if evaluation.no_tools_available and evaluation.status == "in_progress":
+            print(f"⚠️  Corrección: no_tools_available=True requiere status 'completed' o 'failed'")
+            evaluation.status = "failed"
+        
+        return evaluation
     
     async def initialize(self):
         """Descubre las herramientas disponibles y configura el prompt dinámicamente"""
@@ -107,99 +194,141 @@ Parámetros:
         
         # Crear los prompts dinámicamente con las herramientas descubiertas
         decision_template = create_decision_template(tools_description)
-        self.decision_chain = decision_template | self.llm.with_structured_output(ToolDecision)
+        # Retry logic: 3 intentos con backoff exponencial para decision
+        self.decision_chain = (
+            decision_template | 
+            self.llm.with_structured_output(ToolDecision, include_raw=True)
+        )
         
         evaluation_template = create_evaluation_template(tools_description)
-        self.evaluation_chain = evaluation_template | self.llm.with_structured_output(GoalEvaluation)
+        # Retry logic: 3 intentos con backoff exponencial para evaluation
+        self.evaluation_chain = (
+            evaluation_template | 
+            self.llm.with_structured_output(GoalEvaluation, include_raw=True)
+        )
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(OutputParserException)
+    )
     async def evaluate_node(self, state: AgentState) -> AgentState:
-        """Evalúa el progreso y decide el siguiente paso."""
+        """Evalúa el progreso y decide el siguiente paso con retry logic."""
         print(f"\n--- Iteración {state['iteration']}/{state['max_iterations']} ---")
         print("📊 Evaluando progreso...")
         
-        evaluation: GoalEvaluation = await self.evaluation_chain.ainvoke({
-            "goal": state["goal"],
-            "history": str(state["history"][-5:]),
-            "last_result": state["last_result"]
-        })
+        # Usar ventana deslizante de historial
+        recent_history = self._format_history_for_llm(state["history"])
+        
+        try:
+            evaluation_result = await self.evaluation_chain.ainvoke({
+                "goal": state["goal"],
+                "history": recent_history,
+                "last_result": state["last_result"]
+            })
+            
+            # Extraer parsed result (puede ser dict o objeto)
+            if isinstance(evaluation_result, dict) and "parsed" in evaluation_result:
+                evaluation = evaluation_result["parsed"]
+            else:
+                evaluation = evaluation_result
+            
+        except OutputParserException as e:
+            print(f"⚠️  Error de parsing en evaluación (intento con retry): {e}")
+            # Dejar que tenacity lo reintente
+            raise
+        except Exception as e:
+            print(f"❌ Error inesperado en evaluación: {e}")
+            # Crear evaluación por defecto para continuar
+            evaluation = GoalEvaluation(
+                status="failed",
+                next_step="",
+                reasoning=f"Error al evaluar: {str(e)}",
+                no_tools_available=False
+            )
+        
+        # ✅ VALIDACIÓN EN CÓDIGO (no en template)
+        evaluation = self._validate_evaluation(evaluation)
         
         print(f"🧠 Evaluación: {evaluation.reasoning}")
         print(f"📌 Estado: {evaluation.status}")
         
-        # Mapear el status único a los campos del estado
-        state["completed"] = evaluation.status == "completed"
-        state["can_continue"] = evaluation.status == "in_progress"
-        state["current_step"] = evaluation.next_step
-        state["iteration"] += 1
-        
-        # ✅ DETECCIÓN ESTRUCTURADA: Si no_tools_available=True, finalizar inmediatamente
+        # Mapear status a AgentStatus enum
         if evaluation.no_tools_available:
-            print("🛑 El LLM determinó que no hay herramientas disponibles para esta tarea")
-            print(f"   Razón: {evaluation.reasoning}")
-            state["completed"] = True  # Marcar como completado
-            state["can_continue"] = False  # Detener iteraciones
-            state["last_result"] = evaluation.reasoning  # Guardar explicación del LLM
+            # Caso explícito: el LLM indica que no hay herramientas útiles.
+            state["status"] = AgentStatus.NO_TOOLS
+            state["completed"] = True
+            state["can_continue"] = False
+            state["last_result"] = evaluation.reasoning
+        elif evaluation.status == "completed":
+            state["status"] = AgentStatus.COMPLETED
+            state["completed"] = True
+            state["can_continue"] = False
+            # ✅ Preservar contexto para finalize_node
+            state["last_result"] = evaluation.reasoning
+        elif evaluation.status == "failed":
+            state["status"] = AgentStatus.FAILED
+            state["completed"] = False
+            state["can_continue"] = False
+        else:  # in_progress
+            state["status"] = AgentStatus.EXECUTING
+            state["completed"] = False
+            state["can_continue"] = True
+        
+        state["current_step"] = evaluation.next_step
+
+        # Solo incrementamos iteración mientras siga en progreso
+        if state["status"] == AgentStatus.EXECUTING:
+            state["iteration"] += 1
+            # Detección de límite de iteraciones solo para estados no terminales
+            if state["iteration"] >= state["max_iterations"]:
+                state["status"] = AgentStatus.MAX_ITERATIONS
+                state["can_continue"] = False
+                print(f"⚠️  Alcanzado límite de {state['max_iterations']} iteraciones")
         
         return state
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(OutputParserException)
+    )
     async def decide_node(self, state: AgentState) -> AgentState:
-        """Decide qué herramienta usar."""
+        """Decide qué herramienta usar con retry logic y validación."""
         print(f"➡️  Siguiente paso: {state['current_step']}")
         
         try:
-            decision: ToolDecision = await self.decision_chain.ainvoke({
+            decision_result = await self.decision_chain.ainvoke({
                 "question": state["current_step"]
             })
             
-            print(f"🧠 Razonamiento: {decision.reasoning}")
-            print(f"🔧 Tool sugerida: {decision.tool}")
-            print(f"❓ Needs tool: {decision.needs_tool}")
+            # Extraer parsed result
+            if isinstance(decision_result, dict) and "parsed" in decision_result:
+                decision = decision_result["parsed"]
+            else:
+                decision = decision_result
             
-            # Corrección: Si needs_tool=True pero tool está vacío, extraer del next_step
-            if decision.needs_tool and not decision.tool:
-                next_step_lower = state['current_step'].lower()
-                
-                # Usar las herramientas descubiertas dinámicamente
-                # Ordenar por longitud descendente para evitar coincidencias parciales
-                sorted_tools = sorted(self.available_tools, key=len, reverse=True)
-                
-                for tool_name in sorted_tools:
-                    if tool_name in next_step_lower:
-                        print(f"⚠️  Corrección: Detecté '{tool_name}' en el next_step.")
-                        decision.tool = tool_name
-                        
-                        # Intentar extraer parámetros genéricamente del next_step
-                        # Buscar patrones como: tool_name(param1=value1, param2=value2)
-                        import re
-                        params_match = re.search(rf'{tool_name}\s*\((.*?)\)', state['current_step'])
-                        if params_match and not decision.arguments:
-                            params_str = params_match.group(1)
-                            # Parsear parámetros: ip=192.168.0.1, filename=test.txt
-                            params = {}
-                            for param in params_str.split(','):
-                                if '=' in param:
-                                    key, value = param.split('=', 1)
-                                    params[key.strip()] = value.strip()
-                            if params:
-                                decision.arguments = params
-                                print(f"⚠️  Corrección: Extraídos parámetros - {params}")
-                        
-                        break
-            
-            # Corrección: Si menciona una herramienta pero needs_tool=False, forzar
-            if not decision.needs_tool and decision.tool:
-                print(f"⚠️  Corrección: El LLM sugirió '{decision.tool}' pero marcó needs_tool=False. Forzando a True.")
-                decision.needs_tool = True
-            
-            state["tool_decision"] = {
-                "needs_tool": decision.needs_tool,
-                "tool": decision.tool,
-                "arguments": decision.arguments
-            }
+        except OutputParserException as e:
+            print(f"⚠️  Error de parsing en decisión (intento con retry): {e}")
+            raise
         except Exception as e:
-            print(f"❌ Error en decide_node: {str(e)}")
+            print(f"❌ Error inesperado en decisión: {e}")
             state["can_continue"] = False
             state["last_result"] = f"Error al decidir herramienta: {str(e)}"
+            return state
+        
+        # ✅ VALIDACIÓN EN CÓDIGO (no heurísticas en template)
+        decision = self._validate_tool_decision(decision, state)
+        
+        print(f"🧠 Razonamiento: {decision.reasoning}")
+        print(f"🔧 Tool: {decision.tool if decision.tool else 'Ninguna'}")
+        print(f"❓ Needs tool: {decision.needs_tool}")
+        
+        state["tool_decision"] = {
+            "needs_tool": decision.needs_tool,
+            "tool": decision.tool,
+            "arguments": decision.arguments
+        }
         
         return state
     
@@ -214,6 +343,24 @@ Parámetros:
         
         tool_name = decision["tool"]
         args = decision["arguments"]
+        
+        # ✅ Validar IDs antes de get_documents_by_ids
+        if tool_name == "get_documents_by_ids":
+            ids = args.get("ids", [])
+            if not ids or not all(isinstance(i, str) and i.strip() for i in ids):
+                result_str = "Error: IDs vacíos o inválidos. Usar IDs completos de búsquedas previas."
+                print(f"❌ {result_str}")
+                history_entry: HistoryEntry = {
+                    "step": state["current_step"],
+                    "tool": tool_name,
+                    "args": args,
+                    "result": result_str
+                }
+                state["full_history"].append(history_entry)
+                state["history"].append(history_entry)
+                state["history"] = state["history"][-MAX_HISTORY_WINDOW:]
+                state["last_result"] = result_str
+                return state
         
         print(f"⚙️  Ejecutando: {tool_name}({args})")
         
@@ -236,12 +383,21 @@ Parámetros:
             result_str = f"Error: {str(e)}"
             print(f"❌ {result_str}")
         
-        state["history"].append({
+        history_entry = {
             "step": state["current_step"],
             "tool": tool_name,
             "args": args,
             "result": result_str
-        })
+        }
+        
+        # Agregar a full_history (sin límites)
+        state["full_history"].append(history_entry)
+        
+        # Agregar a history con ventana deslizante
+        state["history"].append(history_entry)
+        if len(state["history"]) > MAX_HISTORY_WINDOW:
+            state["history"] = state["history"][-MAX_HISTORY_WINDOW:]
+        
         state["last_result"] = result_str
         
         return state
@@ -253,7 +409,7 @@ Parámetros:
         print(f"{'='*60}\n")
         
         # ✅ Si no hay historial (no se ejecutaron herramientas), usar last_result directamente
-        if not state["history"]:
+        if not state["full_history"]:
             # El LLM ya explicó por qué no puede responder en last_result
             # state["final_answer"] = state["last_result"]
             
@@ -275,7 +431,7 @@ Parámetros:
             # Si hay historial, generar resumen de las acciones realizadas
             response: Response = await self.response_chain.ainvoke({
                 "question": f"Resume lo que hiciste para cumplir: {state['goal']}",
-                "tool_result": str(state["history"])
+                "tool_result": str(state["full_history"])
             })
             state["final_answer"] = response.answer
         
@@ -287,17 +443,25 @@ Parámetros:
 # ==========================
 
 def should_continue(state: AgentState) -> Literal["decide", "finalize", "end"]:
-    """Decide el siguiente nodo basándose en el estado."""
+    """Decide el siguiente nodo con routing explícito basado en AgentStatus."""
     
-    # Si completó el objetivo → finalizar
-    if state["completed"]:
+    status = state.get("status", AgentStatus.EXECUTING)
+    
+    # Si ya no podemos continuar, siempre intentamos pasar por finalize_node
+    # para devolver alguna respuesta al usuario (aunque sea parcial).
+    if not state.get("can_continue", True) or status in [
+        AgentStatus.COMPLETED,
+        AgentStatus.NO_TOOLS,
+        AgentStatus.FAILED,
+        AgentStatus.MAX_ITERATIONS,
+    ]:
         return "finalize"
     
-    # Si no puede continuar o alcanzó límite → terminar
-    if not state["can_continue"] or state["iteration"] >= state["max_iterations"]:
-        return "end"
+    # Verificación adicional de límites de seguridad
+    if state.get("iteration", 0) >= state.get("max_iterations", 0):
+        return "finalize"
     
-    # Continuar con el siguiente paso
+    # Continuar ejecutando
     return "decide"
 
 
@@ -344,7 +508,11 @@ async def create_agent_graph(llm, client):
     # Edge de finalize al END
     workflow.add_edge("finalize", END)
     
-    return workflow.compile()
+    # ✅ Aumentar recursion_limit para evitar errores prematuros
+    return workflow.compile(
+        checkpointer=None,
+        debug=False  # Cambiar a True para ver el flujo completo del grafo
+    )
 
 
 # ==========================
@@ -371,7 +539,7 @@ async def main():
         # },        
         "opensearch": {
             "transport": "streamable_http",
-            "url": "http://localhost:8000/mcp",  # URL del servidor weather_mcp_server_remote.py
+            "url": "http://localhost:8000/mcp",  # URL del servidor opensearch_mcp_server.py
         },
         "internet": {
             "command": "python",
@@ -380,7 +548,8 @@ async def main():
         }
     })
     
-    # Crear el grafo (ahora es async)
+    # Crear el grafo UNA SOLA VEZ antes del loop
+    print("🔧 Inicializando agente...")
     graph = await create_agent_graph(llm, client)
     
     print("="*60)
@@ -400,27 +569,32 @@ async def main():
         if not user_input:
             continue
         
-        # Estado inicial
+        # Estado inicial (nuevo en cada consulta)
         initial_state: AgentState = {
             "goal": user_input,
             "history": [],
+            "full_history": [],
             "current_step": "",
             "last_result": "Comenzando...",
             "completed": False,
             "can_continue": True,
             "iteration": 0,
-            "max_iterations": 15,
+            "max_iterations": 7,  # ✅ Reducido de 15 a 7 para mayor eficiencia
             "final_answer": "",
-            "tool_decision": {}
+            "tool_decision": {},
+            "status": AgentStatus.PLANNING
         }
         
-        # Ejecutar el grafo
-        final_state = await graph.ainvoke(initial_state)
-        
-        if final_state.get("final_answer"):
-            print(f"✅ {final_state['final_answer']}")
-        else:
-            print(f"⚠️  No se pudo completar el objetivo")
+        # Ejecutar el grafo (reutilizado)
+        try:
+            final_state = await graph.ainvoke(initial_state)
+            
+            if final_state.get("final_answer"):
+                print(f"\n✅ {final_state['final_answer']}\n")
+            else:
+                print(f"\n⚠️  No se pudo completar el objetivo\n")
+        except Exception as e:
+            print(f"\n❌ Error al ejecutar: {e}\n")
 
 
 if __name__ == "__main__":

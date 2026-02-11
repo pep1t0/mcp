@@ -1,10 +1,12 @@
 import json
 import os
+import hashlib
+from functools import lru_cache
 from typing import Dict, List, Any, Optional, Union
-from pydantic import Field
+from pydantic import BaseModel, Field, ValidationError
 
 from dotenv import load_dotenv
-from opensearchpy import OpenSearch
+from opensearchpy import AsyncOpenSearch
 from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
@@ -26,6 +28,96 @@ embedding_model = SentenceTransformer("intfloat/multilingual-e5-base")
 logger.info(f"Embedding model loaded successfully! Dimensions: {embedding_model.get_sentence_embedding_dimension()}")
 
 
+# ==========================
+# 📝 MODELOS DE VALIDACIÓN
+# ==========================
+
+class RangeQuery(BaseModel):
+    """Validación para queries de tipo range."""
+    range: Optional[Dict[str, Any]] = None
+
+class TermQuery(BaseModel):
+    """Validación para queries de tipo term."""
+    term: Optional[Dict[str, Any]] = None
+
+class MatchQuery(BaseModel):
+    """Validación para queries de tipo match."""
+    match: Optional[Dict[str, Any]] = None
+
+class BoolQuery(BaseModel):
+    """Validación para queries de tipo bool."""
+    bool: Optional[Dict[str, Any]] = None
+
+class OpenSearchQueryDSL(BaseModel):
+    """Modelo de validación para Query DSL de OpenSearch."""
+    range: Optional[Dict[str, Any]] = None
+    term: Optional[Dict[str, Any]] = None
+    match: Optional[Dict[str, Any]] = None
+    bool: Optional[Dict[str, Any]] = None
+    match_all: Optional[Dict[str, Any]] = None
+    exists: Optional[Dict[str, Any]] = None
+    
+    class Config:
+        extra = "allow"  # Permitir campos adicionales para flexibilidad
+
+
+# ==========================
+# 💾 CACHE DE EMBEDDINGS
+# ==========================
+
+@lru_cache(maxsize=1000)
+def _get_embedding_cached(query: str) -> tuple:
+    """Cache de embeddings con LRU para queries repetidas.
+    
+    Args:
+        query: Texto a convertir en embedding
+    
+    Returns:
+        Tuple de floats (para ser hasheable en LRU cache)
+    """
+    embedding = embedding_model.encode(query)
+    return tuple(embedding.tolist())
+
+
+def get_embedding(query: str) -> List[float]:
+    """Obtiene embedding con cache, devuelve como lista."""
+    return list(_get_embedding_cached(query))
+
+
+def validate_filter_query(filter_query: Union[str, Dict, None]) -> Optional[Dict]:
+    """Valida y parsea filter_query usando Pydantic.
+    
+    Args:
+        filter_query: Query DSL como string JSON o dict
+    
+    Returns:
+        Dict validado o None si es inválido
+    """
+    if filter_query is None:
+        return None
+    
+    try:
+        # Parsear si es string
+        if isinstance(filter_query, str):
+            parsed = json.loads(filter_query)
+        else:
+            parsed = filter_query
+        
+        # Validar estructura básica
+        OpenSearchQueryDSL(**parsed)
+        return parsed
+        
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid JSON in filter_query: {e}")
+        return None
+    except ValidationError as e:
+        logger.warning(f"Invalid Query DSL structure: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Error validating filter_query: {e}")
+        return None
+
+
 def get_opensearch_config():
     """Get OpenSearch configuration from environment variables."""
     config = {
@@ -42,12 +134,12 @@ def get_opensearch_config():
 
 
 def get_opensearch_client():
-    """Create and return OpenSearch client for self-hosted/local instance."""
+    """Create and return AsyncOpenSearch client for self-hosted/local instance."""
     config = get_opensearch_config()
     
     logger.info(f"Connecting to OpenSearch at {config['host']}:{config['port']}...")
     
-    client = OpenSearch(
+    client = AsyncOpenSearch(
         hosts=[{"host": config["host"], "port": config["port"]}],
         http_auth=(config["user"], config["password"]) if config["user"] else None,
         use_ssl=config["use_ssl"],
@@ -57,14 +149,7 @@ def get_opensearch_client():
         timeout=30
     )
     
-    # Verify connection (optional - comment out if OpenSearch may not be available at startup)
-    try:
-        info = client.info()
-        logger.info(f"Connected to OpenSearch {info['version']['number']}")
-    except Exception as e:
-        logger.warning(f"Could not verify OpenSearch connection at startup: {e}")
-        logger.warning("Connection will be attempted when tools are used")
-        # Don't raise - allow server to start even if OpenSearch is not available yet
+    logger.info("AsyncOpenSearch client created (connection will be verified on first use)")
     
     return client
 
@@ -104,8 +189,8 @@ async def get_indexes():
     try:
         logger.info("📋 Retrieving list of indexes from OpenSearch...")
         
-        # Get all indexes using cat API
-        response = client.cat.indices(format='json')
+        # Get all indexes using cat API (async)
+        response = await client.cat.indices(format='json')
         
         # Extract index names, filtering only user OSINT indexes (ending with _osint)
         index_names = [
@@ -168,24 +253,16 @@ async def vector_search(
         if vector_field is None:
             vector_field = config["vector_field"]
         
-        # Parse filter_query if it's a string
-        parsed_filter = None
-        if filter_query:
-            if isinstance(filter_query, str):
-                try:
-                    parsed_filter = json.loads(filter_query)
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON in filter_query, ignoring: {filter_query[:100]}")
-                    parsed_filter = None
-            elif isinstance(filter_query, dict):
-                parsed_filter = filter_query
+        # ✅ Validar filter_query con Pydantic
+        parsed_filter = validate_filter_query(filter_query)
+        if filter_query and not parsed_filter:
+            logger.warning("filter_query provided but validation failed, ignoring filter")
         
-        
-        # Generate embedding if query is text
+        # ✅ Generar embedding con CACHE
         if isinstance(query, str):
             logger.info(f"🔮 Generating embedding for query: '{query[:50]}...'")
-            vector = embedding_model.encode(query).tolist()
-            logger.info(f"✅ Embedding generated: {len(vector)} dimensions")
+            vector = get_embedding(query)  # Usa cache LRU
+            logger.info(f"✅ Embedding generated/retrieved from cache: {len(vector)} dimensions")
         elif isinstance(query, list):
             vector = query
         else:
@@ -223,7 +300,7 @@ async def vector_search(
             }
         
         logger.info(f"🔍 Searching index '{index_name}' with KNN query...")
-        response = client.search(index=index_name, body=knn_query)
+        response = await client.search(index=index_name, body=knn_query)
         
         # Format results
         search_results = []
@@ -283,8 +360,8 @@ async def get_documents_by_ids(
         mget_body = {"ids": ids}
         source_includes = ["url", "published_at", "content_text", "criticality_score", "analysis_justification"]
         
-        # Use mget (multi-get) to fetch multiple documents
-        response = client.mget(
+        # Use mget (multi-get) to fetch multiple documents (async)
+        response = await client.mget(
             index=index_name, 
             body=mget_body,
             _source_includes=source_includes
@@ -382,7 +459,7 @@ async def text_search(
                 **source_filter
             }
 
-        response = client.search(index=index_name, body=search_query)
+        response = await client.search(index=index_name, body=search_query)
         
         # Format results
         search_results = []
@@ -456,8 +533,8 @@ async def hybrid_search(
         
         logger.info(f"🔀 Performing hybrid search in '{index_name}' for: '{query_text[:50]}...'")
         
-        # Generate embedding
-        vector = embedding_model.encode(query_text).tolist()
+        # ✅ Generate embedding con CACHE
+        vector = get_embedding(query_text)
 
         source_filter = {
             "_source": {
@@ -513,7 +590,7 @@ async def hybrid_search(
             **source_filter
         }
         
-        response = client.search(index=index_name, body=hybrid_query)
+        response = await client.search(index=index_name, body=hybrid_query)
         
         # Format results
         search_results = []
@@ -585,8 +662,8 @@ async def get_index_mapping(
         
         logger.info(f"🗂️  Retrieving field mappings for index: '{index_name}'...")
         
-        # Get index mapping using OpenSearch _mapping API
-        response = client.indices.get_mapping(index=index_name)
+        # Get index mapping using OpenSearch _mapping API (async)
+        response = await client.indices.get_mapping(index=index_name)
         
         # Extract the mapping for the specific index
         if index_name in response:
